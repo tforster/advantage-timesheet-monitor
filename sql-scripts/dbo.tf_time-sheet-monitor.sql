@@ -1,85 +1,118 @@
-DECLARE @DateToCheck VARCHAR(25)
+USE TRAINING
+DECLARE @LoDateToCheck VARCHAR(25)
+DECLARE @HiDateToCheck VARCHAR(25)
 DECLARE @HoursThreshold INT
-DECLARE @Id BIGINT
-DECLARE @MaxId BIGINT
-DECLARE @Query NVARCHAR(1024)
-DECLARE @EMP_EMAIL VARCHAR(50)
-DECLARE @SUBJECT NVARCHAR(256)
-DECLARE @BODY NVARCHAR(MAX)
-DECLARE @EMP_TOTAL_HRS DECIMAL
-DECLARE @EMP_DATE DATETIME
-DECLARE @EMP_FULLNAME VARCHAR(61)
+DECLARE @MessageSubject NVARCHAR(256)
+DECLARE @MessageBody NVARCHAR(MAX)
+DECLARE @CurrentEmployeeEMail VARCHAR(50)
+DECLARE @EntryId BIGINT
+DECLARE @EmployeeName VARCHAR(61)
+DECLARE @EmployeeEmail VARCHAR(50)
+DECLARE @EntryHours DECIMAL
+DECLARE @EntryDate DATETIME
 
--- Calculate "yesterday" based on current system time. Assumption: This is run once every 24 hours.
-SET @DateToCheck =  LEFT(CONVERT(VARCHAR, CONVERT(date, DATEADD(day,-1,SYSDATETIME())), 120), 10)+ ' 00:00:00.000'
+-- Ensure the DATEFIRST system parameter is set U.S. English default value of 7 or 'Sunday'.
+SET DATEFIRST 7;
+
+-- Calculate low and high dates as yesterday and a week yesterday based on current system time.
+SET @LoDateToCheck = LEFT(CONVERT(VARCHAR, CONVERT(date, DATEADD(day,-7,SYSDATETIME())), 120), 10)+ ' 00:00:00.000'
+SET @HiDateToCheck = LEFT(CONVERT(VARCHAR, CONVERT(date, DATEADD(day,-1,SYSDATETIME())), 120), 10)+ ' 00:00:00.000'
+SET @CurrentEmployeeEMail = ''
 
 /*** Editable parameters start ***/
-SET @HoursThreshold = 6.5						-- Flag timesheets that are less than this value
-SET @SUBJECT = 'Timesheets!'					-- Email subject
-SET @DateToCheck = '2014-07-01 00:00:00.000'    -- Testing override. Remove this line in production!
+SET @HoursThreshold = 6.5							-- Flag timesheets that are less than this value
+SET @MessageSubject = 'Timesheets!'					-- Email subject
+SET @LoDateToCheck = '2014-06-24 00:00:00.000'		-- Testing override. Remove this line in production!
+SET @HiDateToCheck = '2014-07-01 00:00:00.000'		-- Testing override. Remove this line in production!
 /*** Editable parameters end ***/
 
-/******************************************************************************
- * Calculate the range of EMP_TIME Ids (ET_ID) to process.
- *****************************************************************************/
-SELECT 
-	@Id=MIN([ET_ID]), @MaxId=MAX([ET_ID])
+-- Prepare a temporary table by removing any previous one
+IF OBJECT_ID('tempdb..#TimeSheetTemp') IS NOT NULL DROP TABLE #TimeSheetTemp
+
+-- Select all offending entries into a temporary table
+SELECT
+	ET_ID AS EntryId,
+	EMP_EMAIL AS EmployeeEmail,
+	EMP_FNAME + ' ' + EMP_LNAME AS EmployeeName,
+	EMP_TOT_HRS AS EntryHours, 
+	EMP_TIME.EMP_DATE AS EntryDate
+INTO #TimeSheetTemp		
 FROM 
-	[TRAINING].[dbo].[EMPLOYEE_CLOAK]  
+	EMPLOYEE_CLOAK
 FULL OUTER JOIN 
-	[TRAINING].[dbo].[EMP_TIME]
+	EMP_TIME
 ON 
-	[TRAINING].[dbo].[EMP_TIME].[EMP_CODE] = [TRAINING].[dbo].[EMPLOYEE_CLOAK].[EMP_CODE]  
+	EMP_TIME.EMP_CODE = EMPLOYEE_CLOAK.EMP_CODE
 WHERE 
-	[TRAINING].[dbo].[EMP_TIME].[EMP_DATE] > @DateToCheck
-	AND [TRAINING].[dbo].[EMP_TIME].[FREELANCE] <> 1
-	AND [EMP_TOT_HRS] < @HoursThreshold
-	-- Testing override. Remove this line in production!
-	AND [TRAINING].[dbo].[EMPLOYEE_CLOAK].[EMP_FNAME] = 'Ola';
+	EMP_TIME.EMP_DATE >= @LoDateToCheck
+	AND EMP_TIME.EMP_DATE <= @HiDateToCheck
+	--AND DATEPART(DW, EMP_TIME.EMP_DATE) <> 1
+	AND DATEPART(DW, EMP_TIME.EMP_DATE) <> 7
+	AND EMP_TIME.FREELANCE <> 1
+	AND EMP_TOT_HRS < @HoursThreshold
+	AND EMP_EMAIL IS NOT NULL		
 
-/******************************************************************************
- * Iterate from minimum EMP_TIME Id (@Id) to maximum EMP_TIME Id (@MaxId). Note
- * that we add 1 to @MaxId otherwise if there is only one record then 
- * @Id = @MaxId and the loop does not execute.
- *****************************************************************************/
-WHILE @Id < @MaxId + 1 BEGIN
-	-- Select necessary fields for @Id
-	SELECT
-		@EMP_EMAIL = [EMP_EMAIL],
-		@EMP_TOTAL_HRS = [EMP_TOT_HRS], 
-		@EMP_DATE = [TRAINING].[dbo].[EMP_TIME].[EMP_DATE],		
-		@BODY = [EMP_FNAME] + ' ' + [EMP_LNAME] + ' you have only logged ' + CAST([EMP_TOT_HRS] AS NVARCHAR(10)) + ' hours for ' + CAST(@EMP_DATE AS NVARCHAR(20)) + '. Please update your timesheet.'
+-- Setup and open a cursor for #TimeSheetTemp
+DECLARE TimeEntryCursor CURSOR FOR
+	SELECT 		
+		EntryId,
+		EmployeeEmail,
+		EmployeeName,
+		EntryHours, 
+		EntryDate	
 	FROM 
-		[TRAINING].[dbo].[EMPLOYEE_CLOAK]
-	FULL OUTER JOIN 
-		[TRAINING].[dbo].[EMP_TIME]
-	ON 
-		[TRAINING].[dbo].[EMP_TIME].[EMP_CODE] = [TRAINING].[dbo].[EMPLOYEE_CLOAK].[EMP_CODE]  
-	WHERE 
-		[ET_ID] = @Id
+		#TimeSheetTemp
+	ORDER BY
+		EmployeeEmail,
+		EntryDate
+
+OPEN TimeEntryCursor
+
+-- Seed the iterator
+FETCH NEXT FROM TimeEntryCursor INTO
+	@EntryId,
+	@EmployeeEmail,
+	@EmployeeName,
+	@EntryHours,
+	@EntryDate
+
+-- Iterate the collection	
+WHILE @@FETCH_STATUS = 0 BEGIN
+	IF @CurrentEmployeeEMail <> @EmployeeEMail BEGIN
 	
-	-- Construct the parameters and execute the email sproc
-	EXEC msdb.dbo.sp_send_dbmail 
-		@profile_name = 'TimeSheetProfile',
-		@recipients = 'troy.forster@gmail.com',
-		--@recipients = @EMP_EMAIL,
-		@subject = @SUBJECT,
-		@body =  @BODY
+		-- We have changed names	
+		IF @CurrentEmployeeEMail <> '' BEGIN
+			-- Send the email			
+			EXEC msdb.dbo.sp_send_dbmail 
+				@profile_name = 'TimeSheetProfile',
+				@recipients = 'troy.forster@gmail.com',
+				--@recipients = @EmployeeEmail
+				@subject = @MessageSubject,
+				@body =  @MessageBody
+				
+		END 
 
-	-- Select the next sequential available ET_ID.
-	SELECT 
-		@Id=MIN([ET_ID]) 
-	FROM 
-		[TRAINING].[dbo].[EMPLOYEE_CLOAK]  
-	FULL OUTER JOIN 
-		[TRAINING].[dbo].[EMP_TIME]
-	ON 
-		[TRAINING].[dbo].[EMP_TIME].[EMP_CODE] = [TRAINING].[dbo].[EMPLOYEE_CLOAK].[EMP_CODE]  
-	WHERE 
-		[TRAINING].[dbo].[EMP_TIME].[EMP_DATE] > @DateToCheck
-		AND [TRAINING].[dbo].[EMP_TIME].[FREELANCE] <> 1
-		AND [EMP_TOT_HRS] < @HoursThreshold
-		AND [ET_ID]> @Id
-		-- Testing override. Remove this line in production!
-		AND [TRAINING].[dbo].[EMPLOYEE_CLOAK].[EMP_FNAME] = 'Ola'
+		-- Reset the MessageBody
+		SET @MessageBody = @EmployeeName + ' you are missing the following time entries:' + CHAR(13) + CAST(@EntryDate AS NVARCHAR(20)) + ' logged ' + CAST(@EntryHours AS NVARCHAR(10)) + ' hours. ' + CHAR(10)
+		
+		-- Set the next Employee Email
+		SET @CurrentEmployeeEMail = @EmployeeEmail
+
+	END ELSE BEGIN
+		-- We are still processing the same Employee Email
+		SET @MessageBody = @MessageBody + CAST(@EntryDate AS NVARCHAR(20)) + ' logged ' + CAST(@EntryHours AS NVARCHAR(10)) + ' hours. ' + CHAR(13)
+	END
+
+	-- Select the next iterator
+	FETCH NEXT FROM TimeEntryCursor INTO
+		@EntryId,
+		@EmployeeEmail,
+		@EmployeeName,
+		@EntryHours,
+		@EntryDate
 END
+
+-- Cleanup everythig
+CLOSE TimeEntryCursor;
+DEALLOCATE TimeEntryCursor;
+DROP TABLE #TimeSheetTemp
