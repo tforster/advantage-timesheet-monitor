@@ -10,6 +10,15 @@ DECLARE @EmployeeName VARCHAR(61)
 DECLARE @EmployeeEmail VARCHAR(50)
 DECLARE @EntryHours DECIMAL
 DECLARE @EntryDate DATETIME
+DECLARE @DisplayDate VARCHAR(20)
+DECLARE @CR VARCHAR(1)
+DECLARE @CR2 VARCHAR(2)
+DECLARE @Greeting VARCHAR(128)
+DECLARE @Salutation VARCHAR(128)
+
+-- Helper variables for constructing the message
+SET @CR = CHAR(13)
+SET @CR2 = CHAR(13) + CHAR(13)
 
 -- Ensure the DATEFIRST system parameter is set U.S. English default value of 7 or 'Sunday'.
 SET DATEFIRST 7;
@@ -21,7 +30,9 @@ SET @CurrentEmployeeEMail = ''
 
 /*** Editable parameters start ***/
 SET @HoursThreshold = 6.5							-- Flag timesheets that are less than this value
-SET @MessageSubject = 'Timesheets!'					-- Email subject
+SET @MessageSubject = 'Timesheets!'					
+SET @Greeting = 'Thank you for completing your time sheets, but you still have time missing for the following days:'
+SET @Salutation = 'Thank you,' + @CR2 + 'The Finance Department'
 SET @LoDateToCheck = '2014-06-24 00:00:00.000'		-- Testing override. Remove this line in production!
 SET @HiDateToCheck = '2014-07-01 00:00:00.000'		-- Testing override. Remove this line in production!
 /*** Editable parameters end ***/
@@ -46,8 +57,9 @@ ON
 WHERE 
 	EMP_TIME.EMP_DATE >= @LoDateToCheck
 	AND EMP_TIME.EMP_DATE <= @HiDateToCheck
+	-- Uncomment the following two lines in production to enable weekend checking 
 	--AND DATEPART(DW, EMP_TIME.EMP_DATE) <> 1
-	AND DATEPART(DW, EMP_TIME.EMP_DATE) <> 7
+	--AND DATEPART(DW, EMP_TIME.EMP_DATE) <> 
 	AND EMP_TIME.FREELANCE <> 1
 	AND EMP_TOT_HRS < @HoursThreshold
 	AND EMP_EMAIL IS NOT NULL		
@@ -82,6 +94,9 @@ WHILE @@FETCH_STATUS = 0 BEGIN
 	
 		-- We have changed names	
 		IF @CurrentEmployeeEMail <> '' BEGIN
+			-- Finish the message with the salutation
+			SET @MessageBody = @MessageBody + @Salutation
+
 			-- Send the email			
 			EXEC msdb.dbo.sp_send_dbmail 
 				@profile_name = 'TimeSheetProfile',
@@ -92,15 +107,18 @@ WHILE @@FETCH_STATUS = 0 BEGIN
 				
 		END 
 
-		-- Reset the MessageBody
-		SET @MessageBody = @EmployeeName + ' you are missing the following time entries:' + CHAR(13) + CAST(@EntryDate AS NVARCHAR(20)) + ' logged ' + CAST(@EntryHours AS NVARCHAR(10)) + ' hours. ' + CHAR(10)
+		-- Reset the MessageBody		
+		SET @MessageBody = @EmployeeName + ',' + @CR2 + @Greeting + @CR2 + (left(convert(varchar, @EntryDate, 100), 11)) + ' you have submitted ' + CAST(@EntryHours AS NVARCHAR(10)) + ' hours. '
 		
+		-- Set the next Employee Email
+		SET @CurrentEmployeeEMail = @EmployeeEmail
+
 		-- Set the next Employee Email
 		SET @CurrentEmployeeEMail = @EmployeeEmail
 
 	END ELSE BEGIN
 		-- We are still processing the same Employee Email
-		SET @MessageBody = @MessageBody + CAST(@EntryDate AS NVARCHAR(20)) + ' logged ' + CAST(@EntryHours AS NVARCHAR(10)) + ' hours. ' + CHAR(13)
+		SET @MessageBody = @MessageBody + @CR + (left(convert(varchar, @EntryDate, 100), 11)) + ' you have submitted ' + CAST(@EntryHours AS NVARCHAR(10)) + ' hours. ' + @CR2
 	END
 
 	-- Select the next iterator
